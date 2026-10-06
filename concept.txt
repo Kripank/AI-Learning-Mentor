@@ -1,0 +1,10 @@
+CONCEPT NOTE
+Name: Kripank Kumbhare
+Date: 5/10/2026
+Project Name: AI Waste Segregation Assistant  
+Why I Chose This Problem
+Improper waste segregation is a common problem because people often do not know which category a waste item belongs to. This causes different types of waste to be mixed together, making recycling and proper waste management difficult.
+Solution
+The AI Waste Segregation Assistant allows users to upload an image of a waste item. AI identifies the item, classifies it as Plastic, Paper, Glass, Metal, Organic, or Other, and recommends the appropriate disposal method.
+Who Will Benefit
+This project will benefit households, students, schools, colleges, and environmentally conscious people by helping them understand how to properly segregate and dispose of waste.

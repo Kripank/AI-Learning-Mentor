@@ -1,145 +1,98 @@
 import os
-import json
-from flask import Flask, request, jsonify, render_template
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template, session
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 
-load_dotenv()
+# Always load .env from the same folder as app.py, regardless of cwd
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # needed for session
 
-# ── Configure Gemini ──────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ── Groq configuration ────────────────────────────────────────────────────────
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
-# ── Waste Management Agent ────────────────────────────────────────────────────
-CATEGORIES = ["Plastic", "Paper", "Glass", "Metal", "Organic", "Other"]
+if GROQ_API_KEY:
+    print(f"[GROQ] API key loaded (ends ...{GROQ_API_KEY[-4:]})")
+else:
+    print("[GROQ] WARNING: GROQ_API_KEY is NOT set.")
+    print("[GROQ] Create waste-app/.env and add:  GROQ_API_KEY=your_key_from_console.groq.com")
 
-DISPOSAL_MAP = {
-    "Plastic": {
-        "action": "Put it in the plastic / recycling bin.",
-        "explanation": (
-            "Plastic takes hundreds of years to decompose. Recycling it "
-            "saves energy and reduces pollution. Make sure it is clean and dry."
-        ),
-    },
-    "Paper": {
-        "action": "Put it in the paper / recycling bin.",
-        "explanation": (
-            "Paper is highly recyclable. Keep it dry and free from food stains. "
-            "Recycling paper saves trees and reduces landfill waste."
-        ),
-    },
-    "Glass": {
-        "action": "Put it in the glass / recycling bin.",
-        "explanation": (
-            "Glass can be recycled indefinitely without losing quality. "
-            "Rinse the item before disposing to avoid contamination."
-        ),
-    },
-    "Metal": {
-        "action": "Put it in the metal / recycling bin.",
-        "explanation": (
-            "Metals like aluminium and steel are 100 % recyclable. "
-            "Recycling metal uses far less energy than producing new metal."
-        ),
-    },
-    "Organic": {
-        "action": "Put it in the organic / compost bin.",
-        "explanation": (
-            "Organic waste breaks down naturally and makes excellent compost. "
-            "Composting reduces methane emissions from landfills."
-        ),
-    },
-    "Other": {
-        "action": "Dispose of it at a general waste or special collection point.",
-        "explanation": (
-            "This item does not fit standard recycling categories. "
-            "Check your local waste authority for proper disposal guidelines."
-        ),
-    },
-}
+print(f"[GROQ] Using model: {GROQ_MODEL}")
 
-
-def waste_agent(image_bytes: bytes, mime_type: str) -> dict:
-    """
-    Waste Management Agent:
-    1. Sends the image to Gemini Vision for identification.
-    2. Classifies the detected item into one of the six categories.
-    3. Returns the result with a disposal recommendation.
-    """
-    if not GEMINI_API_KEY:
-        return {
-            "error": "GEMINI_API_KEY is not set. Please add it to the .env file."
-        }
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    prompt = (
-        "You are a waste classification assistant. "
-        "Look at this image and respond ONLY with valid JSON in this exact format:\n"
-        '{"item": "<short name of the waste item>", "category": "<one of: Plastic, Paper, Glass, Metal, Organic, Other>"}\n'
-        "Do not add any explanation outside the JSON."
-    )
-
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=[prompt, image_part],
-    )
-    raw = response.text.strip()
-
-    # Strip markdown code fences if Gemini adds them
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    parsed = json.loads(raw)
-    item = parsed.get("item", "Unknown item")
-    category = parsed.get("category", "Other")
-
-    # Normalise category in case the model returns a variant
-    if category not in CATEGORIES:
-        category = "Other"
-
-    disposal = DISPOSAL_MAP[category]
-    return {
-        "item": item,
-        "category": category,
-        "action": disposal["action"],
-        "explanation": disposal["explanation"],
-    }
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are an AI Learning Mentor for students. "
+    "Help students understand educational topics using clear, simple explanations. "
+    "Break difficult concepts into smaller parts. "
+    "Give examples when useful. "
+    "Help create study plans, summaries, practice questions, and quizzes. "
+    "Use bullet points and numbered lists to make answers easy to read. "
+    "Encourage students to understand concepts instead of blindly copying answers. "
+    "Do not pretend to have real-world teaching credentials. "
+    "Do not give dangerous or inappropriate advice. "
+    "If you are unsure about something, say so honestly."
+)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    # Initialise conversation history for this session
+    if "history" not in session:
+        session["history"] = []
     return render_template("index.html")
 
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded."}), 400
+@app.route("/chat", methods=["POST"])
+def chat():
+    if not GROQ_API_KEY:
+        return jsonify({
+            "error": (
+                "GROQ_API_KEY is missing. "
+                "Create a .env file and add your Groq API key: "
+                "GROQ_API_KEY=your_key_from_console.groq.com"
+            )
+        }), 500
 
-    file = request.files["image"]
-    if file.filename == "":
-        return jsonify({"error": "No file selected."}), 400
+    data = request.get_json()
+    user_message = (data or {}).get("message", "").strip()
+    if not user_message:
+        return jsonify({"error": "Please enter a message."}), 400
 
-    image_bytes = file.read()
-    mime_type = file.mimetype or "image/jpeg"
+    # Build conversation history
+    history = session.get("history", [])
+    history.append({"role": "user", "content": user_message})
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
-        result = waste_agent(image_bytes, mime_type)
+        client = Groq(api_key=GROQ_API_KEY)
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        ai_reply = completion.choices[0].message.content.strip()
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        print(f"[GROQ ERROR] {type(exc).__name__}: {exc}")
+        return jsonify({"error": f"Groq API error: {exc}"}), 500
 
-    return jsonify(result)
+    history.append({"role": "assistant", "content": ai_reply})
+    session["history"] = history
+
+    return jsonify({"reply": ai_reply})
+
+
+@app.route("/clear", methods=["POST"])
+def clear():
+    session["history"] = []
+    return jsonify({"status": "cleared"})
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
